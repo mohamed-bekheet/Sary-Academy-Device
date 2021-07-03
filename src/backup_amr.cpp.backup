@@ -1,0 +1,396 @@
+#include <Arduino.h>
+#include <AsyncHTTPRequest_Generic.h>
+#include <EEPROM.h>
+#include <ESP8266WiFi.h>
+#include <ESP8266WiFiMulti.h>
+#include <ESP8266HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <WiFiClient.h>
+#include <DNSServer.h>
+#include <WiFiManager.h> // https://github.com/tzapu/WiFiManager
+#include <SPI.h>
+#include <MFRC522.h>
+#include <SoftwareSerial.h> //for mp3 module
+#include <Adafruit_NeoPixel.h>
+
+//uncomment one only to choose which device you need to WORK
+
+#define ATTENDANCE
+//#define KIDSAREA
+
+//new smd board
+#define PIN_LED 10
+
+#define SS_PIN D8  //D8
+#define RST_PIN D4 //D4
+
+#define button_pin 16
+
+#define mp3_rx 5
+#define mp3_tx 4
+
+#define ASYNC_HTTP_DEBUG_PORT Serial
+#define _ASYNC_HTTP_LOGLEVEL_ 1
+
+int status; // the Wifi radio's status
+
+AsyncHTTPRequest request;
+/*
+   //old board
+  #define PIN_LED D3 // On Trinket or Gemma, suggest changing this to 1
+  #define SS_PIN D8//D8
+  #define RST_PIN D4//D4
+  #define button_pin D0
+  #define mp3_rx D1
+  #define mp3_tx D0
+*/
+
+#define cmd 3
+#define par1 5
+#define par2 6
+#define checkSumM 7
+#define checkSumL 8
+
+#ifdef ATTENDANCE
+const char *url = "http://192.168.1.201/sary-system/api-attendances.php";
+const char *api_key = "42f12f-b368be-e7fbb4-de0036-56975d";
+#endif
+
+#ifdef KIDSAREA
+const char *url = "http://192.168.1.200/sary-system/api.php";
+const char *api_key = "f13b5611-170a-4174-9dfb-f5d68dbde960";
+#endif
+
+int re_tries = 5;
+int timesouthttp = 5000; //5s
+
+SoftwareSerial mp3Ser(mp3_tx, mp3_rx, false); //SoftwareSerial(rxPin, txPin, inverse_logic, buffer size);
+//start byte,version,Length,CMD,Feedback,Para_MSB,Para_LSB,checksum_MSByte,checksum_MSByte,End byte
+char stack[10] = {0x7E, 0xFF, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xEF};
+
+Adafruit_NeoPixel pixels(1, PIN_LED, NEO_GRB + NEO_KHZ800);
+
+MFRC522 rfid(SS_PIN, RST_PIN); // Instance of the class
+MFRC522::MIFARE_Key key;
+
+String CardID = "3";
+String button_state = "released";
+String payload;
+void card_reader_begin(void)
+{
+  SPI.begin();     // Init SPI bus
+  rfid.PCD_Init(); // Init MFRC522
+}
+void sendStack(uint8_t command, uint8_t parameter1, uint8_t parameter2)
+{
+  return;
+  uint16_t checkSum = (0xFFFF - (0x105 + command + parameter1 + parameter2) + 1);
+  uint8_t sumL = (uint8_t)checkSum; //most sig..
+  uint8_t sumM = (checkSum >> 8);   //least siginificant
+  stack[cmd] = command;
+  stack[par1] = parameter1;
+  stack[par2] = parameter2;
+  stack[checkSumM] = sumM;
+  stack[checkSumL] = sumL;
+  for (int i = 0; i < 10; i++)
+  {
+    mp3Ser.write(stack[i]);
+  }
+  //unsigned int n = USART_Read();
+}
+void playTrack(uint8_t folder, uint8_t track)
+{
+
+  sendStack(0x0F, folder, track);
+}
+void set_volume(uint8_t vol)
+{
+  sendStack(0x06, 0x00, vol);
+}
+void play_random(void)
+{
+  sendStack(0x18, 0x00, 0x00);
+}
+void Handle_msg(String msg)
+{
+  if (msg == "This User is Registerd Before")
+    playTrack(01, 0x001);
+  else if (msg == "the card has been added")
+    playTrack(01, 0x002);
+  else if (msg == "Timer Started")
+    playTrack(01, 0x003);
+  else if (msg == "Timer Stopped")
+    playTrack(01, 0x004);
+  else if (msg == "Recharge your card")
+    playTrack(01, 0x005);
+  else if (msg == "This Card has not registered before")
+    playTrack(01, 0x006);
+  delay(3000);
+}
+void Handle_msg_att(String msg)
+{
+  if (msg == "This User is Registerd Before")
+    playTrack(01, 0x001);
+  else if (msg == "the card has been added")
+    playTrack(01, 0x002);
+  else if (msg == "Logged IN")
+    playTrack(01, 0x00A); //logged in succ
+  else if (msg == "Logged OUT")
+    playTrack(01, 0x00B); //logged out succ
+  else if (msg == "Please create this user first")
+    playTrack(01, 0x006);
+  else if (msg == "Please enter the card type")
+    playTrack(01, 0x01B); //fill card details
+  else if (msg == "This Card has not registered before")
+    playTrack(01, 0x006);
+  delay(3000);
+}
+
+String saved_ssid;
+String saved_pass;
+
+void sendRequest()
+{
+  static bool requestOpenResult;
+
+  if (request.readyState() == readyStateUnsent || request.readyState() == readyStateDone)
+  {
+    //requestOpenResult = request.open("GET", "http://worldtimeapi.org/api/timezone/Europe/London.txt");
+    requestOpenResult = request.open("POST", url);
+
+    if (requestOpenResult)
+    {
+      // Only send() if open() returns true, or crash
+      request.setReqHeader("Content-Type", "application/x-www-form-urlencoded");
+      String data_sent = "key=" + String(api_key) + "&code=" + CardID + "&tag=" + button_state + "";
+      request.send(data_sent);
+    }
+    else
+    {
+      Serial.println("Can't send bad request");
+    }
+  }
+  else
+  {
+    Serial.println("Can't send request");
+  }
+}
+
+void requestCB(void *optParm, AsyncHTTPRequest *request, int readyState)
+{
+  String payload, data_sent;
+  (void)optParm;
+
+  if (readyState == readyStateDone)
+  {
+    if (request->responseHTTPcode() != 200)
+    {
+      playTrack(01, 0x008); //wifi is not connected
+      Serial.println("HTTP ERROR !");
+      //ESP.restart();
+      payload = request->responseText();
+      Serial.println("httpRequestData: ");
+      Serial.print(url);
+      Serial.println(data_sent);
+      Serial.print("Code:");
+      Serial.println(request->responseHTTPcode());
+      Serial.print("msg:");
+      Serial.println(payload);
+      delay(600);
+      return;
+    }
+
+    re_tries--;
+    if (request->responseHTTPcode() == 200)
+    {
+      pixels.setPixelColor(0, pixels.Color(0, 255, 0));
+      pixels.show(); //GREEN
+      Serial.println("Succesful posting");
+      Serial.println("httpRequestData: ");
+      Serial.print(url);
+      Serial.println(data_sent);
+      Serial.print("Code:");
+      Serial.println(request->responseHTTPcode());
+      Serial.print("msg:");
+      Serial.println(payload);
+      re_tries = 0;
+      button_state = "released";
+#ifdef ATTENDANCE
+      Handle_msg_att(payload); //mp3
+#endif
+#ifdef KIDSAREA
+      Handle_msg(payload); //mp3
+#endif
+    }
+  }
+}
+
+void setup()
+{
+
+  delay(100);
+  card_reader_begin();
+  Serial.begin(115200);
+  mp3Ser.begin(9600);
+  delay(500);
+  Serial.println("ESP powered on");
+  pixels.begin();
+  delay(100);
+  pixels.clear(); // Set all pixel colors to 'off'
+  pixels.setPixelColor(0, pixels.Color(255, 0, 0));
+  pixels.show(); //RED
+  set_volume(30);
+  delay(200);
+  //EEPROM.begin(512); //Initializing EEPROM
+  delay(10);
+  playTrack(01, 0x008); //wifi is not connected
+  delay(2000);
+  playTrack(01, 0x015); //connect to AP SARY ACADEMY DEVICE
+  delay(1000);
+
+  //WiFiManager wifiManager;
+  /*
+    bool is_wifi_saved = false;
+    if (wifiManager.getWiFiIsSaved()) {
+    saved_ssid = wifiManager.getWiFiSSID();
+    saved_pass = wifiManager.getWiFiPass();
+    is_wifi_saved = true;
+    }
+
+    Serial.println(saved_ssid);
+    Serial.println(saved_pass);
+  */
+  //wifiManager.resetSettings();// Uncomment and run it once, if you want to erase all the stored information
+
+  IPAddress local_ip(192, 168, 1, 1);
+  IPAddress gateway(192, 168, 1, 1);
+  IPAddress netmask(255, 255, 255, 0);
+
+  //WiFi.softAPConfig(local_ip, gateway, netmask);
+  //wifiManager.autoConnect("Sary Academy DEVICE");
+  /*
+    if (!is_wifi_saved)
+    {
+     wifiManager.autoConnect("Sary Academy DEVICE");
+    }
+    //wifiManager.setConnectTimeout(30);
+    //wifiManager.preloadWiFi(saved_ssid,saved_pass);
+    //wifiManager.autoConnect("Sary Academy DEVICE");
+  */
+  //WiFi.disconnect();
+  WiFi.mode(WIFI_STA);
+  WiFi.begin("mohamed", "mohamed2024");
+  WiFi.setAutoReconnect(true);
+  int wifi_retry = 50;
+  while (WiFi.status() != WL_CONNECTED)
+  {
+    delay(200);
+    Serial.print('.');
+    if (--wifi_retry == 0)
+    {
+      Serial.println("failed to connect");
+      break;
+    }
+  }
+
+  if (WiFi.status() == WL_CONNECTED)
+  {
+
+    request.setDebug(false);
+    request.onReadyStateChange(requestCB);
+    Serial.println("Connected.");
+    playTrack(01, 0x018); //wifi connected
+    pixels.setPixelColor(0, pixels.Color(0, 0, 255));
+    pixels.show(); //blue
+                   // delay(2000);
+  }
+  else
+  {
+    Serial.println("connection failed");
+  }
+  //delay(7000);
+
+  Serial.println(F("Start Scanning Any Card..."));
+  playTrack(01, 0x007); //wlecome to sary academy
+  //delay(2000);
+  Serial.println("before connected check");
+  if (WiFi.status() == WL_CONNECTED)
+  {
+    Serial.println("Connected2");
+  }
+}
+
+void loop()
+{
+
+  // if (!digitalRead(button_pin))
+  // {
+  //   pixels.setPixelColor(0, pixels.Color(255, 0, 0));
+  //   pixels.show(); //RED
+  //   delay(1000);
+  //   if (WiFi.status() == WL_CONNECTED)
+  //   {
+  //     sendRequest();
+  //   }
+  //   else
+  //   {
+  //     Serial.println("request not sent");
+  //   }
+  // }
+  // return;
+
+  
+  if (!digitalRead(button_pin))
+  {
+    button_state = "pressed";
+    pixels.setPixelColor(0, pixels.Color(255, 100, 0));
+    pixels.show();        //orange
+    playTrack(01, 0x01A); //swap ur card
+    delay(600);
+  }
+  // Reset the loop if no new card present on the sensor/reader. This saves the entire process when idle.
+  if (!rfid.PICC_IsNewCardPresent())
+   return;
+   if (!rfid.PICC_ReadCardSerial())
+   return;
+  pixels.setPixelColor(0, pixels.Color(255, 255, 0));
+  pixels.show(); // yellow
+  //WHEN CARD DETECTED
+#ifdef ATTENDANCE
+  if (button_state != "pressed")
+    playTrack(01, 0x012); //please be patient and wait for the response
+#endif
+#ifdef KIDSAREA
+  if (button_state != "pressed")
+    playTrack(01, 0x013); //hello our future hero
+#endif
+
+  Serial.println(F("A new card has been detected."));
+  CardID = "";
+  for (byte i = 0; i < 4; i++)
+  {
+    CardID += String(rfid.uid.uidByte[i], HEX);
+  }
+  Serial.print(F("CARD:"));
+  Serial.println(CardID);
+  delay(2000);
+
+  //http request
+  re_tries = 2;
+  if (WiFi.status() == WL_CONNECTED)
+  {
+    sendRequest();
+  }
+  else
+  {
+    Serial.println("request not sent");
+  }
+
+  delay(1000);
+  // Halt PICC
+  rfid.PICC_HaltA();
+  // Stop encryption on PCD
+  rfid.PCD_StopCrypto1();
+  pixels.setPixelColor(0, pixels.Color(167, 0, 255));
+  pixels.show(); //purple (normal mode)
+}
